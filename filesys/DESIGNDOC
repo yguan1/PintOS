@@ -1,0 +1,277 @@
+       	     +-------------------------+
+		     |		    CS 140	       |
+		     | PROJECT 4: FILE SYSTEMS |
+		     |	   DESIGN DOCUMENT     |
+		     +-------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+50% Yuxin Guan <yguan1@uchicago.edu>
+50% Jiayi Lin <jiayilin286@uchicago.edu>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+We have passed all the tests (including syn-rw) on our own vm, but syn-rw
+could encounter the time-out error mentioned in Piazza post #303 when running on 
+linux.cs.uchicago.edu.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+		     INDEXED AND EXTENSIBLE FILES
+		     ============================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+/* In-memory inode. */
+struct inode
+  {
+    struct list_elem elem;              /* Element in inode list. */
+    block_sector_t sector;              /* Sector number of disk location. */
+    int open_cnt;                       /* Number of openers. */
+    bool removed;                       /* True if deleted, false otherwise. */
+    struct lock lock;                   /* Protects the inode. */
+
+    /* Denying writes. */
+    struct lock deny_write_lock;        /* Protects members below. */
+    struct condition no_writers_cond;   /* Signaled when no writers. */
+    int deny_write_cnt;                 /* 0: writes ok, >0: deny writes. */
+    int writer_cnt;                     /* Number of writers. */
+  };
+
+  /* In-disk inode. */
+  struct inode_disk
+  {
+    block_sector_t sectors[SECTOR_CNT]; /* Sectors. */
+    enum inode_type type;               /* FILE_INODE or DIR_INODE. */
+    off_t length;                       /* File size in bytes. */
+    unsigned magic;                     /* Magic number. */
+  };
+
+>> A2: What is the maximum size of a file supported by your inode
+>> structure?  Show your work.
+
+The maximum size of a file can be calcualted from the inode structure.
+Inside the inode structure, we have 123 direct pointers, 1 indirect pointer 
+and 1 doubly indirect pointer. 
+- For every direct pointer, it can pointer to a sector of size/ a block in the filesystem, 
+which is 512 bytes (defined in block.h). 
+- For every indirect pointer, it points to a block of 512 bytes, inside which contains
+pointers to data blocks. Since each block_sector_t is uint32_t which is a 4 byte unsigned interger, 
+we can calculate that each block contains (512/ 4) = 128 pointers to data block. 
+- For every doubly-indirect pointer, it contains 128 poitners to indirect pointer blocks, and
+each indirect pointer block contains 128 pointers to data block. Hence, with doubly-indirect
+pointer, there are 128 * 128 =  16384 pointers to data block.
+- Hence, in total, the maximum size of a file can be 
+(123 + 128 + 16384) pointers to data block * 512 bytes per block = 8517120 bytes
+
+
+---- SYNCHRONIZATION ----
+
+>> A3: Explain how your code avoids a race if two processes attempt to
+>> extend a file at the same time.
+
+A query for the sector that contains a particular offset into the file
+is atomic along with allocating the sector if it doesn't exist. This means
+that if there are two threads writing to write to the same offset beyond 
+the end of the file, both threads will call get_data_block in inode.c first
+to retrieve the data block and then write to it. When trying to write beyond
+the end of the file, this data block is at first not allocated (and hence inside
+get_data_block we have to allocate a free block to be the data block and set it
+to be all zero). 
+
+Since this function get_data_block could be called in parallel, after finding 
+no data block is allocated, before allocation we do a second check to see whether
+some other thread, in the meantime, has allocated this data block. If yes, we directly
+return this data block allocated by the other threads (so that no multiple data blocks
+are allocated; only one will be allocated). Otherwise, we continue to allocate
+the block for the current thread. 
+
+In terms of updating the new file length, we always update the length of the inode
+after a write beyond the end of the file if the logical length is smaller than the offset
+of the last byte we wrote. Thus, in a race condition, the larger length will always
+persist after all threads are done.
+
+>> A4: Suppose processes A and B both have file F open, both
+>> positioned at end-of-file.  If A reads and B writes F at the same
+>> time, A may read all, part, or none of what B writes.  However, A
+>> may not read data other than what B writes, e.g. if B writes
+>> nonzero data, A is not allowed to see all zeros.  Explain how your
+>> code avoids this race.
+
+Note that inside inode_write_at, we only update the length field when the
+entire extension by B has been written. Hence, when A is positioned at the end-of-file,
+it will not see data written by B until B has finished. A will only be able to
+see the entire extension if it tries to read after B has finished writing.
+
+>> A5: Explain how your synchronization design provides "fairness".
+>> File access is "fair" if readers cannot indefinitely block writers
+>> or vice versa.  That is, many processes reading from a file cannot
+>> prevent forever another process from writing the file, and many
+>> processes writing to a file cannot prevent another process forever
+>> from reading the file.
+
+Our synchronization scheme provides fairness because we have no conditional
+variable for readers and writers at the inode level. Readers and writers are terminated
+the same when they try to acquire the lock in inode to perform read and write.
+(Note that the cond variable inside inode structure is for file_deny_write, called
+at the end of process loading the executable file to make it un-writable. This is
+not used for reader/ writer waiting and blocking.)
+
+---- RATIONALE ----
+
+>> A6: Is your inode structure a multilevel index?  If so, why did you
+>> choose this particular combination of direct, indirect, and doubly
+>> indirect blocks?  If not, why did you choose an alternative inode
+>> structure, and what advantages and disadvantages does your
+>> structure have, compared to a multilevel index?
+
+Our inode structure is a multilevel index. This has the following advantages:
+1. It allows the file to grow without being allocated contiguously. In the previous
+given extent-based implementation, for every extend it has to be allocated 
+contiguously, which means that defragmentation is required if there is no sufficient
+room to allocate a contiguous extent. With multilevel index, we can allocate one sector/
+block at a time and use a pointer pointing to it.
+
+2. It allows the file to grow to a very large size without wasting space in inode structure. 
+In extent-based implementation, a file can only grow when there is a free extent and there 
+is free room to allocate the contiguous extent. To allow the file to grow to a very large 
+size, a large number of extent might have to be chosen at the very beginning (to ensure 
+the fixed size of inode structure), which could lead to inode structure space overhead 
+when we create a small file is created and not a lot of extent entries are used.However, 
+in multilevel index implementation, the file can also grow so long there are free index entry
+and there is free sector to be allocated. Given that there are 123 (direct) + 1* 128 (indirect)
++ 128 * 128 (doubly-indirect) entries, this implementation can satisfy the common case file size
+requirement. In addition, if small files are created, the indirect and doubly-indirect entries
+will not be used and hence no extra blocks need to be allocated, preventing internal fragmentation.
+
+			    SUBDIRECTORIES
+			    ==============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+==================== directory.h ====================
+/* A directory. */
+struct dir
+  {
+    struct inode *inode;                /* Backing store. */
+    off_t pos;                          /* Current position. */
+  };
+
+/* A single directory entry. */
+struct dir_entry
+  {
+    block_sector_t inode_sector;        /* Sector number of header. */
+    char name[NAME_MAX + 1];            /* Null terminated file name. */
+    bool in_use;                        /* In use or free? */
+  };
+
+==================== thread.h ====================
+
+struct thread
+  {
+    ...
+    /* Owned by filesys.c */
+    struct dir *cwd;                    /* Current working directory */
+    ...
+  };
+
+---- ALGORITHMS ----
+
+>> B2: Describe your code for traversing a user-specified path.  How
+>> do traversals of absolute and relative paths differ?
+
+A absolute path starts with '/' and a relative path doesn't. We have a
+function called resolve_name_to_entry() which takes a path and resolves
+it to the directory and the base name. It first checks whether the given
+path is absolute or relative. If it is absolute, the function opens the
+root directory, otherwise it opens the cwd of the current process. And
+then it uses the get_next_part() function to get the next part, and then
+search in the current directory and open the next directory.
+
+---- SYNCHRONIZATION ----
+
+>> B4: How do you prevent races on directory entries?  For example,
+>> only one of two simultaneous attempts to remove a single file
+>> should succeed, as should only one of two simultaneous attempts to
+>> create a file with the same name, and so on.
+
+Reads and writes to the directory are protected by a directory lock.  In
+the case where two processes try to delete an entry, one will execute
+dir_remove atomically and remove the entry, and the next will acquire the
+lock and won't be able to find the entry it's trying to remove.  In the
+case where two threads try to create a file with the same name, one will
+execute atomically under the directory lock, release the lock, and the
+second thread will acquire the directory lock, see that something by that
+name already exists, and return without re-adding the file.  All
+operations that modify a directory are run under the directory lock.
+
+>> B5: Does your implementation allow a directory to be removed if it
+>> is open by a process or if it is in use as a process's current
+>> working directory?  If so, what happens to that process's future
+>> file system operations?  If not, how do you prevent it?
+
+We disallow a directory that's opened by a process to be removed. We
+prevent this by  checking the inode_open_cnt field stored in the inode 
+struct in dir_remove(). If this number is more than 1, we disallow the 
+removal if this directory.
+
+---- RATIONALE ----
+
+>> B6: Explain why you chose to represent the current directory of a
+>> process the way you did.
+
+We add a new field called cwd in the thread struct. It is initiated as NULL,
+which means root directory. When trying to open cwd of a process and it is 
+checked to be NULL, we will open root directory instead. We choose to represent
+the current directory as dir instead of using other attributes such as
+string (directory name) because dir struct contains inode and hence the sector number
+which is more robust than name; the direcotry's name may change, but the inode
+backing this directory and hence the directory should not change.
+
+Furthermore, when we try to change the current working directory of a thread,
+the process will need to open the current working directory as a first step to start
+when descending to child directory or ascending to parent directory (in common case).
+Hence, it simplifies a lot of logic when we already store the current working directory
+as a directory struct inside our thread struct (instead of using string name etc to 
+traverse down the directories, find the current one by name and open it).
+
+
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students in future quarters?
+
+>> Any other comments?
